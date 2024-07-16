@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright (c) 2013-2015, Rethink Robotics
 # All rights reserved.
@@ -32,6 +32,7 @@ Baxter RSDK Joint Trajectory Controller
     Unlike other robots running ROS, this is not a Motor Controller plugin,
     but a regular node using the SDK interface.
 """
+from __future__ import print_function
 import argparse
 
 import rospy
@@ -52,7 +53,7 @@ from trajectory_msgs.msg import (
 )
 
 
-def start_server(limb, rate, mode):
+def start_server(limb, rate, mode, interpolation):
     print("Initializing node... ")
     rospy.init_node("rsdk_%s_joint_trajectory_action_server%s" %
                     (mode, "" if limb == 'both' else "_" + limb,))
@@ -70,11 +71,11 @@ def start_server(limb, rate, mode):
     jtas = []
     if limb == 'both':
         jtas.append(JointTrajectoryActionServer('right', dyn_cfg_srv,
-                                                rate, mode))
+                                                rate, mode, interpolation))
         jtas.append(JointTrajectoryActionServer('left', dyn_cfg_srv,
-                                                rate, mode))
+                                                rate, mode, interpolation))
     else:
-        jtas.append(JointTrajectoryActionServer(limb, dyn_cfg_srv, rate, mode))
+        jtas.append(JointTrajectoryActionServer(limb, dyn_cfg_srv, rate, mode, interpolation))
 
     def cleanup():
         for j in jtas:
@@ -102,8 +103,13 @@ def main():
         choices=['position_w_id', 'position', 'velocity'],
         help="control mode for trajectory execution"
     )
+    parser.add_argument(
+        "-i", "--interpolation", default='bezier',
+        choices=['bezier', 'bezier_with_velocity', 'minjerk'],
+        help="interpolation method for trajectory generation"
+    )
     args = parser.parse_args(rospy.myargv()[1:])
-    start_server(args.limb, args.rate, args.mode)
+    start_server(args.limb, args.rate, args.mode, args.interpolation)
 
 
 if __name__ == "__main__":

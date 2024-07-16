@@ -28,13 +28,15 @@
 """
 Baxter RSDK Joint Trajectory Action Server
 """
+from __future__ import absolute_import
 import bisect
 from copy import deepcopy
 import math
 import operator
 import numpy as np
 
-import bezier
+from . import bezier
+from . import minjerk
 
 import rospy
 
@@ -59,7 +61,7 @@ import baxter_interface
 
 class JointTrajectoryActionServer(object):
     def __init__(self, limb, reconfig_server, rate=100.0,
-                 mode='position_w_id'):
+                 mode='position_w_id', interpolation='bezier'):
         self._dyn = reconfig_server
         self._ns = 'robot/limb/' + limb
         self._fjt_ns = self._ns + '/follow_joint_trajectory'
@@ -72,6 +74,7 @@ class JointTrajectoryActionServer(object):
         self._limb = baxter_interface.Limb(limb)
         self._enable = baxter_interface.RobotEnable()
         self._name = limb
+        self._interpolation = interpolation
         self._cuff = baxter_interface.DigitalIO('%s_lower_cuff' % (limb,))
         self._cuff.state_changed.connect(self._cuff_cb)
         # Verify joint control mode
@@ -191,38 +194,38 @@ class JointTrajectoryActionServer(object):
 
     def _get_current_error(self, joint_names, set_point):
         current = self._get_current_position(joint_names)
-        error = map(operator.sub, set_point, current)
+        error = list(map(operator.sub, set_point, current))
         return zip(joint_names, error)
 
     def _update_feedback(self, cmd_point, jnt_names, cur_time):
-        self._fdbk.header.stamp = rospy.Duration.from_sec(rospy.get_time())
+        self._fdbk.header.stamp = rospy.get_rostime()
         self._fdbk.joint_names = jnt_names
         self._fdbk.desired = cmd_point
         self._fdbk.desired.time_from_start = rospy.Duration.from_sec(cur_time)
         self._fdbk.actual.positions = self._get_current_position(jnt_names)
         self._fdbk.actual.time_from_start = rospy.Duration.from_sec(cur_time)
-        self._fdbk.error.positions = map(operator.sub,
+        self._fdbk.error.positions = list(map(operator.sub,
                                          self._fdbk.desired.positions,
                                          self._fdbk.actual.positions
-                                        )
+                                        ))
         self._fdbk.error.time_from_start = rospy.Duration.from_sec(cur_time)
         self._server.publish_feedback(self._fdbk)
 
     def _reorder_joints_ff_cmd(self, joint_names, point):
-	joint_name_order = self._limb.joint_names()
-	pnt = JointTrajectoryPoint()
-	pnt.time_from_start = point.time_from_start
-	pos_cmd = dict(zip(joint_names, point.positions))
-	for jnt_name in joint_name_order:
-	    pnt.positions.append(pos_cmd[jnt_name])
+        joint_name_order = self._limb.joint_names()
+        pnt = JointTrajectoryPoint()
+        pnt.time_from_start = point.time_from_start
+        pos_cmd = dict(zip(joint_names, point.positions))
+        for jnt_name in joint_name_order:
+            pnt.positions.append(pos_cmd[jnt_name])
         if point.velocities:
-	    vel_cmd = dict(zip(joint_names, point.velocities))
-	    for jnt_name in joint_name_order:
-	        pnt.velocities.append(vel_cmd[jnt_name])
+            vel_cmd = dict(zip(joint_names, point.velocities))
+            for jnt_name in joint_name_order:
+                pnt.velocities.append(vel_cmd[jnt_name])
         if point.accelerations:
-	    accel_cmd = dict(zip(joint_names, point.accelerations))
-	    for jnt_name in joint_name_order:
-	        pnt.accelerations.append(accel_cmd[jnt_name])
+            accel_cmd = dict(zip(joint_names, point.accelerations))
+            for jnt_name in joint_name_order:
+                pnt.accelerations.append(accel_cmd[jnt_name])
         return pnt
 
     def _command_stop(self, joint_names, joint_angles, start_time, dimensions_dict):
@@ -318,7 +321,7 @@ class JointTrajectoryActionServer(object):
         num_traj_dim = sum(dimensions_dict.values())
         num_b_values = len(['b0', 'b1', 'b2', 'b3'])
         b_matrix = np.zeros(shape=(num_joints, num_traj_dim, num_traj_pts-1, num_b_values))
-        for jnt in xrange(num_joints):
+        for jnt in range(num_joints):
             traj_array = np.zeros(shape=(len(trajectory_points), num_traj_dim))
             for idx, point in enumerate(trajectory_points):
                 current_point = list()
@@ -331,6 +334,67 @@ class JointTrajectoryActionServer(object):
             d_pts = bezier.de_boor_control_pts(traj_array)
             b_matrix[jnt, :, :, :] = bezier.bezier_coefficients(traj_array, d_pts)
         return b_matrix
+
+    def _compute_bezier_with_velocity_coeff(self, joint_names, trajectory_points, dimensions_dict):
+        # Compute Full Bezier Curve
+        num_joints = len(joint_names)
+        num_traj_pts = len(trajectory_points)
+        num_traj_dim = sum(dimensions_dict.values())
+        num_b_values = len(['b0', 'b1', 'b2', 'b3'])
+        b_matrix = np.zeros(shape=(num_joints, num_traj_dim, num_traj_pts-1, num_b_values))
+        for jnt in range(num_joints):
+            traj_array = np.zeros(shape=(len(trajectory_points), num_traj_dim))
+            for idx, point in enumerate(trajectory_points):
+                current_point = list()
+                current_point.append(point.positions[jnt])
+                if dimensions_dict['velocities']:
+                    current_point.append(point.velocities[jnt])
+                if dimensions_dict['accelerations']:
+                    current_point.append(point.accelerations[jnt])
+                traj_array[idx, :] = current_point
+            b_matrix[jnt, :, :, :] = bezier.bezier_coefficients(traj_array)
+        return b_matrix
+
+    def _get_minjerk_point(self, m_matrix, idx, t, cmd_time, dimensions_dict):
+        pnt = JointTrajectoryPoint()
+        pnt.time_from_start = rospy.Duration(cmd_time)
+        num_joints = m_matrix.shape[0]
+        pnt.positions = [0.0] * num_joints
+        if dimensions_dict['velocities']:
+            pnt.velocities = [0.0] * num_joints
+        if dimensions_dict['accelerations']:
+            pnt.accelerations = [0.0] * num_joints
+        for jnt in range(num_joints):
+            m_point = minjerk.minjerk_point(m_matrix[jnt, :, :, :], idx, t)
+            # Positions at specified time
+            pnt.positions[jnt] = m_point[0]
+            # Velocities at specified time
+            if dimensions_dict['velocities']:
+                pnt.velocities[jnt] = m_point[1]
+            # Accelerations at specified time
+            if dimensions_dict['accelerations']:
+                pnt.accelerations[jnt] = m_point[-1]
+        return pnt
+
+    def _compute_minjerk_coeff(self, joint_names, trajectory_points, point_duration, dimensions_dict):
+        # Compute Full Minimum Jerk Curve
+        num_joints = len(joint_names)
+        num_traj_pts = len(trajectory_points)
+        num_traj_dim = sum(dimensions_dict.values())
+        num_m_values = len(['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'tm'])
+        m_matrix = np.zeros(shape=(num_joints, num_traj_dim, num_traj_pts-1, num_m_values))
+        for jnt in range(num_joints):
+            traj_array = np.zeros(shape=(len(trajectory_points), num_traj_dim))
+            for idx, point in enumerate(trajectory_points):
+                current_point = list()
+                current_point.append(point.positions[jnt])
+                if dimensions_dict['velocities']:
+                    current_point.append(point.velocities[jnt])
+                if dimensions_dict['accelerations']:
+                    current_point.append(point.accelerations[jnt])
+                traj_array[idx, :] = current_point
+            m_matrix[jnt, :, :, :] = minjerk.minjerk_coefficients(traj_array, point_duration)
+        return m_matrix
 
     def _determine_dimensions(self, trajectory_points):
         # Determine dimensions supplied
@@ -385,15 +449,28 @@ class JointTrajectoryActionServer(object):
         if dimensions_dict['accelerations']:
             trajectory_points[-1].accelerations = [0.0] * len(joint_names)
 
-        # Compute Full Bezier Curve Coefficients for all 7 joints
         pnt_times = [pnt.time_from_start.to_sec() for pnt in trajectory_points]
         try:
-            b_matrix = self._compute_bezier_coeff(joint_names,
-                                                  trajectory_points,
-                                                  dimensions_dict)
+            if self._interpolation == 'minjerk':
+                # Compute Full MinJerk Curve Coefficients for all 7 joints
+                point_duration = [pnt_times[i+1] - pnt_times[i] for i in range(len(pnt_times)-1)]
+                m_matrix = self._compute_minjerk_coeff(joint_names,
+                                                       trajectory_points,
+                                                       point_duration,
+                                                       dimensions_dict)
+            elif self._interpolation == 'bezier_with_velocity':
+                # Compute Full Bezier Curve Coefficients for all 7 joints
+                b_matrix = self._compute_bezier_with_velocity_coeff(
+                    joint_names, trajectory_points, dimensions_dict)
+            else:
+                # Compute Full Bezier Curve Coefficients for all 7 joints
+                b_matrix = self._compute_bezier_coeff(joint_names,
+                                                      trajectory_points,
+                                                      dimensions_dict)
         except Exception as ex:
-            rospy.logerr(("{0}: Failed to compute a Bezier trajectory for {1}"
-                         " arm with error \"{2}: {3}\"").format(
+            rospy.logerr(("{0}: Failed to compute a {1} trajectory for {2}"
+                          " arm with error \"{3}: {4}\"").format(
+                                                  self._interpolation,
                                                   self._action_name,
                                                   self._name,
                                                   type(ex).__name__, ex))
@@ -429,9 +506,14 @@ class JointTrajectoryActionServer(object):
                 cmd_time = 0
                 t = 0
 
-	    point = self._get_bezier_point(b_matrix, idx,
-                                           t, cmd_time,
-				           dimensions_dict)
+            if self._interpolation == 'minjerk':
+                point = self._get_minjerk_point(m_matrix, idx,
+                                                t, cmd_time,
+                                                dimensions_dict)
+            else:
+                point = self._get_bezier_point(b_matrix, idx,
+                                               t, cmd_time,
+                                               dimensions_dict)
 
             # Command Joint Position, Velocity, Acceleration
             command_executed = self._command_joints(joint_names, point, start_time, dimensions_dict)
